@@ -207,12 +207,12 @@ mod private {
             stop: &mut StopVp<'_>,
         ) -> impl Future<Output = Result<(), VpHaltReason<UhRunVpError>>>;
 
-        /// Returns true if the VP is ready to run the given VTL, false if it is halted.
+        /// Process any pending APIC work.
         fn poll_apic(
             this: &mut UhProcessor<'_, Self>,
             vtl: GuestVtl,
             scan_irr: bool,
-        ) -> Result<bool, UhRunVpError>;
+        ) -> Result<(), UhRunVpError>;
 
         /// Requests the VP to exit when an external interrupt is ready to be
         /// delivered.
@@ -235,15 +235,21 @@ mod private {
         /// the target VTL that will become active.
         fn switch_vtl_state(this: &mut UhProcessor<'_, Self>, target_vtl: GuestVtl);
 
+        /// Returns whether this VP should be put to sleep in usermode, or
+        /// whether it's ready to proceed into the kernel.
+        fn halt_in_usermode(this: &mut UhProcessor<'_, Self>, target_vtl: GuestVtl) -> bool {
+            let _ = (this, target_vtl);
+            false
+        }
+
         fn inspect_extra(_this: &mut UhProcessor<'_, Self>, _resp: &mut inspect::Response<'_>) {}
     }
 }
 
 pub struct BackingSharedParams<'a> {
+    pub(crate) _partition: &'a UhPartitionInner,
     #[cfg(guest_arch = "x86_64")]
-    pub(crate) cvm_state: Option<&'a crate::UhCvmPartitionState>,
-    #[cfg(not(guest_arch = "x86_64"))]
-    pub(crate) _phantom: &'a (),
+    pub(crate) cvm_state: Option<crate::UhCvmPartitionState>,
 }
 
 /// Processor backing.
@@ -256,8 +262,12 @@ pub trait Backing: BackingPrivate {
 
 impl<T: BackingPrivate> Backing for T {}
 
-/// Marker trait for processor backings that have hardware isolation support.
-pub trait HardwareIsolatedBacking: Backing {}
+/// Trait for processor backings that have hardware isolation support.
+pub trait HardwareIsolatedBacking: Backing {
+    #[cfg(guest_arch = "x86_64")]
+    /// Gets CVM specific partition state.
+    fn cvm_state(&self) -> &crate::UhCvmPartitionState;
+}
 
 #[cfg_attr(guest_arch = "aarch64", allow(dead_code))]
 #[derive(Inspect, Debug)]
@@ -654,15 +664,13 @@ impl<'p, T: Backing> Processor for UhProcessor<'p, T> {
                     self.update_synic(GuestVtl::Vtl0, true);
                 }
 
-                // TODO CVM GUEST VSM: Split ready into two to track per-vtl
-                let mut ready = false;
                 for vtl in [GuestVtl::Vtl1, GuestVtl::Vtl0] {
                     // Process interrupts.
                     if self.hv(vtl).is_some() {
                         self.update_synic(vtl, false);
                     }
 
-                    ready |= T::poll_apic(self, vtl, scan_irr[vtl] || first_scan_irr)
+                    T::poll_apic(self, vtl, scan_irr[vtl] || first_scan_irr)
                         .map_err(VpHaltReason::Hypervisor)?;
                 }
                 first_scan_irr = false;
@@ -675,11 +683,12 @@ impl<'p, T: Backing> Processor for UhProcessor<'p, T> {
                     }
                 }
 
-                if ready {
+                // TODO WHP GUEST VSM: This should be next_vtl
+                if T::halt_in_usermode(self, GuestVtl::Vtl0) {
+                    break Poll::Pending;
+                } else {
                     return <Result<_, VpHaltReason<_>>>::Ok(()).into();
                 }
-
-                break Poll::Pending;
             })
             .await?;
 
