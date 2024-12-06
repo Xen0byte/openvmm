@@ -36,6 +36,14 @@ mod state {
         pub netvsp_state: Vec<crate::emuplat::netvsp::SavedState>,
     }
 
+    #[derive(Protobuf)]
+    #[mesh(package = "underhill")]
+    pub struct NvmeSavedState {
+        /// NVMe manager (worker) saved state.
+        #[mesh(1)]
+        pub nvme_state: crate::nvme_manager::save_restore::NvmeManagerSavedState,
+    }
+
     /// Servicing state needed to create the LoadedVm object.
     #[derive(Protobuf)]
     #[mesh(package = "underhill")]
@@ -60,11 +68,14 @@ mod state {
         #[mesh(6)]
         pub vmgs: (
             vmgs::save_restore::state::SavedVmgsState,
-            vmgs::save_restore::state::SavedBlockStorageMetadata,
+            disk_get_vmgs::save_restore::SavedBlockStorageMetadata,
         ),
         /// Intercept the host-provided shutdown IC device.
         #[mesh(7)]
         pub overlay_shutdown_device: bool,
+        /// NVMe saved state.
+        #[mesh(10000)]
+        pub nvme_state: Option<NvmeSavedState>,
     }
 
     #[derive(Protobuf)]
@@ -124,9 +135,10 @@ pub mod transposed {
         pub flush_logs_result: Option<Option<FlushLogsResult>>,
         pub vmgs: Option<(
             vmgs::save_restore::state::SavedVmgsState,
-            vmgs::save_restore::state::SavedBlockStorageMetadata,
+            disk_get_vmgs::save_restore::SavedBlockStorageMetadata,
         )>,
         pub overlay_shutdown_device: Option<bool>,
+        pub nvme_state: Option<Option<NvmeSavedState>>,
     }
 
     /// A transposed `Option<EmuplatSavedState>`, where each field of
@@ -154,6 +166,7 @@ pub mod transposed {
                     flush_logs_result,
                     vmgs,
                     overlay_shutdown_device,
+                    nvme_state,
                 } = state;
 
                 OptionServicingInitState {
@@ -167,6 +180,7 @@ pub mod transposed {
                     flush_logs_result: Some(flush_logs_result),
                     vmgs: Some(vmgs),
                     overlay_shutdown_device: Some(overlay_shutdown_device),
+                    nvme_state: Some(nvme_state),
                 }
             } else {
                 OptionServicingInitState::default()
