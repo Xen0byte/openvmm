@@ -85,7 +85,7 @@ pub(crate) enum FatalError {
     #[error("failed to make the IgvmAttest request because shared memory is unavailable")]
     SharedMemoryUnavailable,
     #[error("failed to allocated shared memory")]
-    SharedMemoryAllocationError(#[source] shared_pool_alloc::SharedPoolOutOfMemory),
+    SharedMemoryAllocationError(#[source] page_pool_alloc::PagePoolOutOfMemory),
     #[error("failed to read the `IGVM_ATTEST` response from shared memory")]
     ReadSharedMemory(#[source] guestmem::GuestMemoryError),
     #[error("failed to deserialize the asynchronous `IGVM_ATTEST` response")]
@@ -174,10 +174,7 @@ pub(crate) mod msg {
         Inspect(inspect::Deferred),
         /// Store the shared memory allocator and guest memory for later use by
         /// IGVM attestation.
-        SetupSharedMemoryAllocator(
-            shared_pool_alloc::SharedPoolAllocator,
-            guestmem::GuestMemory,
-        ),
+        SetupSharedMemoryAllocator(page_pool_alloc::PagePoolAllocator, guestmem::GuestMemory),
 
         // Late bound receivers for Guest Notifications
         /// Take the late-bound GuestRequest receiver for Generation Id updates.
@@ -307,15 +304,15 @@ pub(crate) mod msg {
     #[derive(Debug)]
     pub struct VmgsReadInput {
         pub sector_offset: u64,
-        pub length: usize,
-        pub sector_size: usize,
+        pub sector_count: u32,
+        pub sector_size: u32,
     }
 
     #[derive(Debug)]
     pub struct VmgsWriteInput {
         pub sector_offset: u64,
         pub buf: Vec<u8>,
-        pub sector_size: usize,
+        pub sector_size: u32,
     }
 
     #[derive(Debug)]
@@ -471,7 +468,7 @@ pub(crate) struct ProcessLoop<T: RingMem> {
     #[inspect(skip)]
     igvm_attest_read_send: mesh::Sender<Vec<u8>>,
     #[inspect(skip)]
-    shared_pool_allocator: Option<Arc<shared_pool_alloc::SharedPoolAllocator>>,
+    shared_pool_allocator: Option<Arc<page_pool_alloc::PagePoolAllocator>>,
     shared_guest_memory: Option<Arc<guestmem::GuestMemory>>,
     stats: Stats,
 
@@ -1609,14 +1606,14 @@ async fn request_vmgs_read(
 ) -> Result<Result<Vec<u8>, get_protocol::VmgsReadResponse>, FatalError> {
     let msg::VmgsReadInput {
         sector_offset,
-        length,
+        sector_count,
         sector_size,
     } = input;
     access.send_message(
         get_protocol::VmgsReadRequest::new(
             get_protocol::VmgsReadFlags::NONE,
             sector_offset,
-            length as u32,
+            sector_count,
         )
         .as_bytes()
         .to_vec(),
@@ -1624,7 +1621,7 @@ async fn request_vmgs_read(
 
     let buf = access.recv_response().await;
 
-    let vmgs_buf_len = length * sector_size;
+    let vmgs_buf_len = (sector_count * sector_size) as usize;
     let (response, remaining) = get_protocol::VmgsReadResponse::read_from_prefix_split(
         buf.as_slice(),
     )
@@ -1662,7 +1659,7 @@ async fn request_vmgs_write(
     let request = get_protocol::VmgsWriteRequest::new(
         get_protocol::VmgsWriteFlags::NONE,
         input.sector_offset,
-        (input.buf.len() / input.sector_size) as u32,
+        (input.buf.len() / input.sector_size as usize) as u32,
     );
     let message = [request.as_bytes(), &input.buf].concat();
     let response: get_protocol::VmgsWriteResponse =
@@ -1809,7 +1806,7 @@ async fn request_saved_state(
 async fn request_igvm_attest(
     mut access: HostRequestPipeAccess,
     request: msg::IgvmAttestRequestData,
-    shared_pool_allocator: Option<Arc<shared_pool_alloc::SharedPoolAllocator>>,
+    shared_pool_allocator: Option<Arc<page_pool_alloc::PagePoolAllocator>>,
     shared_guest_memory: Option<Arc<guestmem::GuestMemory>>,
 ) -> Result<Result<Vec<u8>, IgvmAttestError>, FatalError> {
     const ALLOCATED_SHARED_MEMORY_SIZE: usize =
