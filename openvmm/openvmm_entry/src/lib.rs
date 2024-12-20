@@ -5,7 +5,6 @@
 //! for the worker process.
 
 mod cli_args;
-mod console;
 mod meshworker;
 mod serial_io;
 mod storage_builder;
@@ -28,6 +27,10 @@ use cli_args::EndpointConfigCli;
 use cli_args::NicConfigCli;
 use cli_args::SerialConfigCli;
 use cli_args::UefiConsoleModeCli;
+use cli_args::VirtioBusCli;
+use disk_backend_resources::layer::DiskLayerHandle;
+use disk_backend_resources::layer::RamDiskLayerHandle;
+use disk_backend_resources::layer::SqliteDiskLayerHandle;
 use floppy_resources::FloppyDiskConfig;
 use framebuffer::FramebufferAccess;
 use framebuffer::FRAMEBUFFER_SIZE;
@@ -78,8 +81,8 @@ use mesh_worker::WorkerEvent;
 use mesh_worker::WorkerHandle;
 use meshworker::VmmMesh;
 use net_backend_resources::mac_address::MacAddress;
-use pal_async::driver::Driver;
 use pal_async::pipe::PolledPipe;
+use pal_async::socket::PolledSocket;
 use pal_async::task::Spawn;
 use pal_async::task::Task;
 use pal_async::timer::PolledTimer;
@@ -117,12 +120,14 @@ use uidevices_resources::SynthKeyboardHandle;
 use uidevices_resources::SynthMouseHandle;
 use uidevices_resources::SynthVideoHandle;
 use video_core::SharedFramebufferHandle;
+use virtio_resources::VirtioPciDeviceHandle;
 use vm_manifest_builder::BaseChipsetType;
 use vm_manifest_builder::MachineArch;
 use vm_manifest_builder::VmChipsetResult;
 use vm_manifest_builder::VmManifestBuilder;
 use vm_resource::kind::DiskHandleKind;
 use vm_resource::kind::NetEndpointHandleKind;
+use vm_resource::kind::VirtioDeviceHandle;
 use vm_resource::kind::VmbusDeviceHandleKind;
 use vm_resource::IntoResource;
 use vm_resource::Resource;
@@ -242,10 +247,10 @@ fn vm_config_from_command_line(
                 Some(serial_io::bind_tcp_serial(&addr).context("failed to bind serial")?)
             }
             SerialConfigCli::NewConsole(app) => {
-                let path = console::random_console_path();
+                let path = console_relay::random_console_path();
                 let config =
                     serial_io::bind_serial(&path).context("failed to bind console serial")?;
-                console::launch_console(app.as_deref(), &path)
+                console_relay::launch_console(app.or_else(openvmm_terminal_app).as_deref(), &path)
                     .context("failed to launch console")?;
 
                 Some(config)
@@ -286,14 +291,14 @@ fn vm_config_from_command_line(
             }
             SerialConfigCli::Tcp(_addr) => anyhow::bail!("TCP virtio serial not supported"),
             SerialConfigCli::NewConsole(app) => {
-                let path = console::random_console_path();
+                let path = console_relay::random_console_path();
 
                 let mut io = SerialIo::new().context("creating serial IO")?;
                 io.spawn_copy_listener(serial_driver.clone(), name, &path)
                     .with_context(|| format!("listening on pipe {}", path.display()))?
                     .detach();
 
-                console::launch_console(app.as_deref(), &path)
+                console_relay::launch_console(app.or_else(openvmm_terminal_app).as_deref(), &path)
                     .context("failed to launch console")?;
                 Some(io.config)
             }
@@ -841,6 +846,14 @@ fn vm_config_from_command_line(
 
         let (send, guest_request_recv) = mesh::channel();
         resources.ged_rpc = Some(send);
+        let vmgs_disk = if let Some(disk) = &opt.get_vmgs {
+            disk_open(disk, false).context("failed to open GET vmgs disk")?
+        } else {
+            disk_backend_resources::LayeredDiskHandle::single_layer(RamDiskLayerHandle {
+                len: Some(vmgs_format::VMGS_DEFAULT_CAPACITY),
+            })
+            .into_resource()
+        };
         vmbus_devices.extend([
             (
                 openhcl_vtl,
@@ -888,6 +901,7 @@ fn vm_config_from_command_line(
                     com2: with_vmbus_com2_serial,
                     vtl2_settings: Some(prost::Message::encode_to_vec(&vtl2_settings)),
                     vmbus_redirection: opt.vmbus_redirect,
+                    vmgs_disk: Some(vmgs_disk),
                     framebuffer: opt
                         .vtl2_gfx
                         .then(|| SharedFramebufferHandle.into_resource()),
@@ -938,8 +952,7 @@ fn vm_config_from_command_line(
                 ppi_store,
                 nvram_store,
                 refresh_tpm_seeds: false,
-                get_attestation_report: None,
-                request_ak_cert: None,
+                ak_cert_type: tpm_resources::TpmAkCertTypeResource::None,
                 register_layout,
                 guest_secret_key: None,
             }
@@ -1117,66 +1130,114 @@ fn vm_config_from_command_line(
     }
 
     let mut virtio_devices = Vec::new();
+    let mut add_virtio_device = |bus, resource: Resource<VirtioDeviceHandle>| {
+        let bus = match bus {
+            VirtioBusCli::Auto => {
+                // Use VPCI when possible (currently only on Windows and macOS due
+                // to KVM backend limitations).
+                if with_hv && (cfg!(windows) || cfg!(target_os = "macos")) {
+                    None
+                } else {
+                    Some(VirtioBus::Pci)
+                }
+            }
+            VirtioBusCli::Mmio => Some(VirtioBus::Mmio),
+            VirtioBusCli::Pci => Some(VirtioBus::Pci),
+            VirtioBusCli::Vpci => None,
+        };
+        if let Some(bus) = bus {
+            virtio_devices.push((bus, resource));
+        } else {
+            vpci_devices.push(VpciDeviceConfig {
+                vtl: DeviceVtl::Vtl0,
+                instance_id: Guid::new_random(),
+                resource: VirtioPciDeviceHandle(resource).into_resource(),
+            });
+        }
+    };
+
     for cli_cfg in &opt.virtio_net {
         if cli_cfg.underhill {
             anyhow::bail!("use --net uh:[...] to add underhill NICs")
         }
         let vport = parse_endpoint(cli_cfg, &mut nic_index, &mut resources)?;
-        virtio_devices.push((
-            VirtioBus::Auto,
+        add_virtio_device(
+            VirtioBusCli::Auto,
             virtio_resources::net::VirtioNetHandle {
                 max_queues: vport.max_queues,
                 mac_address: vport.mac_address,
                 endpoint: vport.endpoint,
             }
             .into_resource(),
-        ));
+        );
     }
 
-    for (tag, root_path) in &opt.virtio_fs {
-        virtio_devices.push((
+    for args in &opt.virtio_fs {
+        add_virtio_device(
             opt.virtio_fs_bus,
             virtio_resources::fs::VirtioFsHandle {
-                tag: tag.clone(),
+                tag: args.tag.clone(),
                 fs: virtio_resources::fs::VirtioFsBackend::HostFs {
-                    root_path: root_path.clone(),
+                    root_path: args.path.clone(),
+                    mount_options: args.options.clone(),
                 },
             }
             .into_resource(),
-        ));
+        );
     }
 
-    for (tag, root_path) in &opt.virtio_fs_shmem {
-        virtio_devices.push((
+    for args in &opt.virtio_fs_shmem {
+        add_virtio_device(
             opt.virtio_fs_bus,
             virtio_resources::fs::VirtioFsHandle {
-                tag: tag.clone(),
+                tag: args.tag.clone(),
                 fs: virtio_resources::fs::VirtioFsBackend::SectionFs {
-                    root_path: root_path.clone(),
+                    root_path: args.path.clone(),
                 },
             }
             .into_resource(),
-        ));
+        );
     }
 
-    for (tag, root_path) in &opt.virtio_9p {
-        virtio_devices.push((
-            VirtioBus::Auto,
+    for args in &opt.virtio_9p {
+        add_virtio_device(
+            VirtioBusCli::Auto,
             virtio_resources::p9::VirtioPlan9Handle {
-                tag: tag.clone(),
-                root_path: root_path.clone(),
+                tag: args.tag.clone(),
+                root_path: args.path.clone(),
                 debug: opt.virtio_9p_debug,
             }
             .into_resource(),
-        ));
+        );
     }
 
     if let Some(path) = &opt.virtio_pmem {
-        virtio_devices.push((
-            VirtioBus::Auto,
+        add_virtio_device(
+            VirtioBusCli::Auto,
             virtio_resources::pmem::VirtioPmemHandle { path: path.clone() }.into_resource(),
-        ));
+        );
     }
+
+    let (vmgs_disk, format_vmgs) = if let Some(path) = &opt.vmgs_file {
+        let file = fs_err::OpenOptions::new()
+            .create(true)
+            .read(true)
+            .write(true)
+            .open(path)
+            .context("failed to create or open vmgs file")?;
+        let format_vmgs = file.metadata()?.len() == 0;
+        if format_vmgs {
+            file.set_len(vmgs_format::VMGS_DEFAULT_CAPACITY)?;
+            disk_vhd1::Vhd1Disk::make_fixed(file.file())
+                .context("failed to format VHD1 file for VMGS")?;
+        }
+        (
+            Some(disk_backend_resources::FixedVhd1DiskHandle(file.into()).into_resource()),
+            format_vmgs,
+        )
+    } else {
+        (None, false)
+    };
 
     let mut cfg = Config {
         chipset,
@@ -1243,10 +1304,8 @@ fn vm_config_from_command_line(
         chipset_devices,
         #[cfg(windows)]
         vpci_resources,
-        vmgs_file: opt
-            .vmgs_file
-            .as_ref()
-            .map(|p| p.to_string_lossy().into_owned()),
+        vmgs_disk,
+        format_vmgs,
         secure_boot_enabled: opt.secure_boot,
         custom_uefi_vars,
         firmware_event_send: None,
@@ -1256,6 +1315,13 @@ fn vm_config_from_command_line(
 
     storage.build_config(&mut cfg, &mut resources, opt.scsi_sub_channels)?;
     Ok((cfg, resources))
+}
+
+/// Gets the terminal to use for externally launched console windows.
+fn openvmm_terminal_app() -> Option<PathBuf> {
+    std::env::var_os("OPENVMM_TERM")
+        .or_else(|| std::env::var_os("HVLITE_TERM"))
+        .map(Into::into)
 }
 
 // Tries to remove `path` if it is confirmed to be a Unix socket.
@@ -1381,7 +1447,11 @@ impl NicConfig {
 
 fn disk_open(disk_cli: &DiskCliKind, read_only: bool) -> anyhow::Result<Resource<DiskHandleKind>> {
     let disk_type = match disk_cli {
-        &DiskCliKind::Memory(len) => Resource::new(disk_backend_resources::RamDiskHandle { len }),
+        &DiskCliKind::Memory(len) => {
+            Resource::new(disk_backend_resources::LayeredDiskHandle::single_layer(
+                RamDiskLayerHandle { len: Some(len) },
+            ))
+        }
         DiskCliKind::File(path) => open_disk_type(path, read_only)
             .with_context(|| format!("failed to open {}", path.display()))?,
         DiskCliKind::Blob { kind, url } => Resource::new(disk_backend_resources::BlobDiskHandle {
@@ -1392,13 +1462,97 @@ fn disk_open(disk_cli: &DiskCliKind, read_only: bool) -> anyhow::Result<Resource
             },
         }),
         DiskCliKind::MemoryDiff(inner) => {
-            Resource::new(disk_backend_resources::RamDiffDiskHandle {
-                lower: disk_open(inner, true)?,
+            Resource::new(disk_backend_resources::LayeredDiskHandle {
+                layers: vec![
+                    RamDiskLayerHandle { len: None }.into_resource().into(),
+                    DiskLayerHandle(disk_open(inner, true)?)
+                        .into_resource()
+                        .into(),
+                ],
             })
         }
         DiskCliKind::PersistentReservationsWrapper(inner) => Resource::new(
             disk_backend_resources::DiskWithReservationsHandle(disk_open(inner, read_only)?),
         ),
+        DiskCliKind::Crypt {
+            disk,
+            cipher,
+            key_file,
+        } => Resource::new(disk_crypt_resources::DiskCryptHandle {
+            disk: disk_open(disk, read_only)?,
+            cipher: match cipher {
+                cli_args::DiskCipher::XtsAes256 => disk_crypt_resources::Cipher::XtsAes256,
+            },
+            key: fs_err::read(key_file).context("failed to read key file")?,
+        }),
+        DiskCliKind::Sqlite {
+            path,
+            create_with_len,
+        } => {
+            // FUTURE: this code should be responsible for opening
+            // file-handle(s) itself, and passing them into sqlite via a custom
+            // vfs. For now though - simply check if the file exists or not, and
+            // perform early validation of filesystem-level create options.
+            match (create_with_len.is_some(), path.exists()) {
+                (true, true) => anyhow::bail!(
+                    "cannot create new sqlite disk at {} - file already exists",
+                    path.display()
+                ),
+                (false, false) => anyhow::bail!(
+                    "cannot open sqlite disk at {} - file not found",
+                    path.display()
+                ),
+                _ => {}
+            }
+
+            Resource::new(disk_backend_resources::LayeredDiskHandle::single_layer(
+                SqliteDiskLayerHandle {
+                    dbhd_path: path.display().to_string(),
+                    format_dbhd: create_with_len.map(|len| {
+                        disk_backend_resources::layer::SqliteDiskLayerFormatParams {
+                            logically_read_only: false,
+                            len: Some(len),
+                        }
+                    }),
+                },
+            ))
+        }
+        DiskCliKind::SqliteDiff { path, create, disk } => {
+            // FUTURE: this code should be responsible for opening
+            // file-handle(s) itself, and passing them into sqlite via a custom
+            // vfs. For now though - simply check if the file exists or not, and
+            // perform early validation of filesystem-level create options.
+            match (create, path.exists()) {
+                (true, true) => anyhow::bail!(
+                    "cannot create new sqlite disk at {} - file already exists",
+                    path.display()
+                ),
+                (false, false) => anyhow::bail!(
+                    "cannot open sqlite disk at {} - file not found",
+                    path.display()
+                ),
+                _ => {}
+            }
+
+            Resource::new(disk_backend_resources::LayeredDiskHandle {
+                layers: vec![
+                    SqliteDiskLayerHandle {
+                        dbhd_path: path.display().to_string(),
+                        format_dbhd: create.then_some(
+                            disk_backend_resources::layer::SqliteDiskLayerFormatParams {
+                                logically_read_only: false,
+                                len: None,
+                            },
+                        ),
+                    }
+                    .into_resource()
+                    .into(),
+                    DiskLayerHandle(disk_open(disk, true)?)
+                        .into_resource()
+                        .into(),
+                ],
+            })
+        }
     };
 
     Ok(disk_type)
@@ -1424,7 +1578,7 @@ fn do_main() -> anyhow::Result<()> {
     }
 
     if let Some(path) = opt.relay_console_path {
-        return console::relay_console(&path);
+        return console_relay::relay_console(&path);
     }
 
     if let Some(path) = opt.ttrpc.as_ref().or(opt.grpc.as_ref()) {
@@ -1575,7 +1729,7 @@ enum InteractiveCommand {
     Hvsock {
         /// the terminal emulator to run (defaults to conhost.exe or xterm)
         #[clap(short, long)]
-        term: Option<String>,
+        term: Option<PathBuf>,
         /// the vsock port to connect to
         port: u32,
     },
@@ -1745,6 +1899,11 @@ async fn run_control(driver: &DefaultDriver, mesh: &VmmMesh, opt: Options) -> an
                         listener,
                         req_chan: req_tx,
                         vp_count: vm_config.processor_topology.proc_count,
+                        target_arch: if cfg!(guest_arch = "x86_64") {
+                            debug_worker_defs::TargetArch::X86_64
+                        } else {
+                            debug_worker_defs::TargetArch::Aarch64
+                        },
                     },
                 )
                 .await
@@ -1778,15 +1937,20 @@ async fn run_control(driver: &DefaultDriver, mesh: &VmmMesh, opt: Options) -> an
         vm_rpc.call(VmRpc::Resume, ()).await?;
     }
 
-    let mut diag_inspector = DiagInspector::new(
+    let paravisor_diag = Arc::new(diag_client::DiagClient::from_dialer(
         driver.clone(),
-        vm_rpc.clone(),
-        if opt.vtl2 {
-            DeviceVtl::Vtl2
-        } else {
-            DeviceVtl::Vtl0
+        DiagDialer {
+            driver: driver.clone(),
+            vm_rpc: vm_rpc.clone(),
+            openhcl_vtl: if opt.vtl2 {
+                DeviceVtl::Vtl2
+            } else {
+                DeviceVtl::Vtl0
+            },
         },
-    );
+    ));
+
+    let mut diag_inspector = DiagInspector::new(driver.clone(), paravisor_diag.clone());
 
     let (console_command_send, console_command_recv) = mesh::channel();
     let (inspect_completion_engine_send, inspect_completion_engine_recv) = mesh::channel();
@@ -2312,7 +2476,9 @@ async fn run_control(driver: &DefaultDriver, mesh: &VmmMesh, opt: Options) -> an
                                 .with_context(|| format!("failed to open {}", path.display()))?
                         }
                         Some(size) => {
-                            Resource::new(disk_backend_resources::RamDiskHandle { len: size })
+                            Resource::new(disk_backend_resources::LayeredDiskHandle::single_layer(
+                                RamDiskLayerHandle { len: Some(size) },
+                            ))
                         }
                     };
 
@@ -2439,7 +2605,6 @@ async fn run_control(driver: &DefaultDriver, mesh: &VmmMesh, opt: Options) -> an
                 let vm_rpc = &vm_rpc;
                 let action = || async move {
                     let service_id = new_hvsock_service_id(port);
-                    let pool = DefaultPool::new();
                     let socket = vm_rpc
                         .call_failable(
                             VmRpc::ConnectHvsock,
@@ -2450,9 +2615,14 @@ async fn run_control(driver: &DefaultDriver, mesh: &VmmMesh, opt: Options) -> an
                             ),
                         )
                         .await?;
-                    let path = console::relay_console_server(&pool.driver(), socket)?;
-                    console::launch_console(term.as_ref().map(|x| x.as_ref()), &path)?;
-                    thread::spawn(move || pool.run());
+                    let socket = PolledSocket::new(driver, socket)?;
+                    let mut console = console_relay::Console::new(
+                        driver.clone(),
+                        term.or_else(openvmm_terminal_app).as_deref(),
+                    )?;
+                    driver
+                        .spawn("console-relay", async move { console.relay(socket).await })
+                        .detach();
                     anyhow::Result::<_>::Ok(())
                 };
 
@@ -2467,9 +2637,8 @@ async fn run_control(driver: &DefaultDriver, mesh: &VmmMesh, opt: Options) -> an
                 let r = async {
                     let start;
                     if user_mode_only {
-                        let diag = connect_diag(driver.clone(), &vm_rpc, DeviceVtl::Vtl2).await?;
                         start = Instant::now();
-                        diag.restart().await?;
+                        paravisor_diag.restart().await?;
                     } else {
                         let path = igvm
                             .as_ref()
@@ -2615,24 +2784,32 @@ async fn run_control(driver: &DefaultDriver, mesh: &VmmMesh, opt: Options) -> an
     Ok(())
 }
 
-async fn connect_diag(
-    driver: impl Driver + Spawn,
-    vm_rpc: &mesh::Sender<VmRpc>,
+struct DiagDialer {
+    driver: DefaultDriver,
+    vm_rpc: Arc<mesh::Sender<VmRpc>>,
     openhcl_vtl: DeviceVtl,
-) -> anyhow::Result<diag_client::DiagClient> {
-    let service_id = new_hvsock_service_id(1);
-    let socket = vm_rpc
-        .call_failable(
-            VmRpc::ConnectHvsock,
-            (
-                CancelContext::new().with_timeout(Duration::from_secs(2)),
-                service_id,
-                openhcl_vtl,
-            ),
-        )
-        .await?;
-    let diag_client = diag_client::DiagClient::from_conn(driver, socket);
-    Ok(diag_client)
+}
+
+impl mesh_rpc::client::Dial for DiagDialer {
+    type Stream = PolledSocket<unix_socket::UnixStream>;
+
+    async fn dial(&mut self) -> io::Result<Self::Stream> {
+        let service_id = new_hvsock_service_id(1);
+        let socket = self
+            .vm_rpc
+            .call_failable(
+                VmRpc::ConnectHvsock,
+                (
+                    CancelContext::new().with_timeout(Duration::from_secs(2)),
+                    service_id,
+                    self.openhcl_vtl,
+                ),
+            )
+            .await
+            .map_err(|err| io::Error::new(io::ErrorKind::Other, err))?;
+
+        PolledSocket::new(&self.driver, socket)
+    }
 }
 
 /// An object that implements [`InspectMut`] by sending an inspect request over
@@ -2644,11 +2821,7 @@ async fn connect_diag(
 pub struct DiagInspector(DiagInspectorInner);
 
 enum DiagInspectorInner {
-    NotStarted {
-        driver: DefaultDriver,
-        vm_rpc: Arc<mesh::Sender<VmRpc>>,
-        openhcl_vtl: DeviceVtl,
-    },
+    NotStarted(DefaultDriver, Arc<diag_client::DiagClient>),
     Started {
         send: mesh::Sender<inspect::Deferred>,
         _task: Task<()>,
@@ -2657,34 +2830,23 @@ enum DiagInspectorInner {
 }
 
 impl DiagInspector {
-    pub fn new(
-        driver: DefaultDriver,
-        vm_rpc: Arc<mesh::Sender<VmRpc>>,
-        openhcl_vtl: DeviceVtl,
-    ) -> Self {
-        Self(DiagInspectorInner::NotStarted {
-            driver,
-            vm_rpc,
-            openhcl_vtl,
-        })
+    pub fn new(driver: DefaultDriver, diag_client: Arc<diag_client::DiagClient>) -> Self {
+        Self(DiagInspectorInner::NotStarted(driver, diag_client))
     }
 
     fn start(&mut self) -> &mesh::Sender<inspect::Deferred> {
         loop {
             match self.0 {
                 DiagInspectorInner::NotStarted { .. } => {
-                    let DiagInspectorInner::NotStarted {
-                        driver,
-                        vm_rpc,
-                        openhcl_vtl,
-                    } = std::mem::replace(&mut self.0, DiagInspectorInner::Invalid)
+                    let DiagInspectorInner::NotStarted(driver, client) =
+                        std::mem::replace(&mut self.0, DiagInspectorInner::Invalid)
                     else {
                         unreachable!()
                     };
                     let (send, recv) = mesh::channel();
-                    let task = driver
-                        .clone()
-                        .spawn("diag-inspect", Self::run(driver, vm_rpc, recv, openhcl_vtl));
+                    let task = driver.clone().spawn("diag-inspect", async move {
+                        Self::run(&client, recv).await
+                    });
 
                     self.0 = DiagInspectorInner::Started { send, _task: task };
                 }
@@ -2695,28 +2857,10 @@ impl DiagInspector {
     }
 
     async fn run(
-        driver: DefaultDriver,
-        vm_rpc: Arc<mesh::Sender<VmRpc>>,
+        diag_client: &diag_client::DiagClient,
         mut recv: mesh::Receiver<inspect::Deferred>,
-        openhcl_vtl: DeviceVtl,
     ) {
-        let mut last_client = None;
         while let Some(deferred) = recv.next().await {
-            let client = if let Some(client) = &mut last_client {
-                client
-            } else {
-                match connect_diag(driver.clone(), &vm_rpc, openhcl_vtl).await {
-                    Ok(client) => last_client.insert(client),
-                    Err(err) => {
-                        deferred.complete_external(
-                            inspect::Node::Failed(inspect::Error::Mesh(format!("{err:#}"))),
-                            inspect::SensitivityLevel::Unspecified,
-                        );
-                        continue;
-                    }
-                }
-            };
-
             let info = deferred.external_request();
             let result = match info.request_type {
                 inspect::ExternalRequestType::Inspect { depth } => {
@@ -2724,18 +2868,17 @@ impl DiagInspector {
                         Ok(inspect::Node::Unevaluated)
                     } else {
                         // TODO: Support taking timeouts from the command line
-                        client
+                        diag_client
                             .inspect(info.path, Some(depth - 1), Some(Duration::from_secs(1)))
                             .await
                     }
                 }
                 inspect::ExternalRequestType::Update { value } => {
-                    (client.update(info.path, value).await).map(inspect::Node::Value)
+                    (diag_client.update(info.path, value).await).map(inspect::Node::Value)
                 }
             };
             deferred.complete_external(
                 result.unwrap_or_else(|err| {
-                    last_client = None;
                     inspect::Node::Failed(inspect::Error::Mesh(format!("{err:#}")))
                 }),
                 inspect::SensitivityLevel::Unspecified,
